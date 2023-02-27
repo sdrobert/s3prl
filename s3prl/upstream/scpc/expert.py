@@ -15,46 +15,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-
 from typing import Dict, List
 
 import torch
-from .modules import *
-
-DEFT_CONFIG = [
-    {"name": ""}
-]
+from .modules import Encoder
 
 
 class UpstreamExpert(torch.nn.Module):
-    def __init__(self, ckpt: str = None, model_config: str = None, **kwargs):
-        super().__init__()
+    encoder: Encoder
+
+    def __init__(self, ckpt: str, **kwargs):
+        super().__init__(**kwargs)
         self.name = "[scpc]"
-        
+        self.encoder = Encoder.from_checkpoint(ckpt, "cpu")
 
     def get_downsample_rates(self, key: str) -> int:
-        """
-        Since we do not do any downsampling in this example upstream
-        All keys' corresponding representations have downsample rate of 1
-        """
-        return 1
+        return self.encoder.downsampling_factor
 
     def forward(self, wavs: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        When the returning Dict contains the List with more than one Tensor,
-        those Tensors should be in the same shape to train a weighted-sum on them.
-        """
-
-        wavs = pad_sequence(wavs, batch_first=True).unsqueeze(-1)
-        # wavs: (batch_size, max_len, 1)
-
-        hidden = self.model1(wavs)
-        # hidden: (batch_size, max_len, hidden_dim)
-
-        feature = self.model2(hidden)
-        # feature: (batch_size, max_len, hidden_dim)
-
-        # The "hidden_states" key will be used as default in many cases
-        # Others keys in this example are presented for SUPERB Challenge
-        return {"hidden_states": hidden}
+        if len(wavs) == 0:
+            return {"hidden_states": torch.empty(0, 0, self.encoder.output_size)}
+        lens = torch.tensor([w.numel() for w in wavs]).to(wavs[0].device)
+        x = torch.nn.utils.rnn.pad_sequence(wavs, batch_first=True).unsqueeze(-1)
+        x, lens = self.encoder(x, lens)
+        return {"hidden_states": x}
