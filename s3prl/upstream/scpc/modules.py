@@ -228,11 +228,7 @@ E = TypeVar("E", bound="Encoder", covariant=True)
 
 
 class Encoder(torch.nn.Module, metaclass=abc.ABCMeta):
-    __slots__ = "input_size", "output_size"
-    __call__: Callable[
-        [torch.Tensor, Optional[torch.Tensor]],
-        Tuple[torch.Tensor, Optional[torch.Tensor]],
-    ]
+    __constants__ = "input_size", "output_size"
     input_size: int
     output_size: int
 
@@ -323,6 +319,21 @@ class Encoder(torch.nn.Module, metaclass=abc.ABCMeta):
         encoder = cls.from_json(json)
         encoder.load_state_dict(state_dict, strict)
         return encoder
+
+    @overload
+    def __call__(
+        self, x: torch.Tensor, lens: Literal[None] = None
+    ) -> Tuple[torch.Tensor, Literal[None]]:
+        ...
+
+    @overload
+    def __call__(
+        self, x: torch.Tensor, lens: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ...
+
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        return super().__call__(*args, **kwds)
 
 
 class IdentityEncoder(Encoder, json_name="id"):
@@ -489,7 +500,7 @@ class ConvEncoder(Encoder, json_name="conv"):
 
 
 class SelfAttentionEncoder(Encoder, json_name="sa"):
-    __slots__ = "pos_period"
+    __constants__ = ("pos_period",)
     pos_period: Optional[int]
     pos_buf: Optional[torch.Tensor]
 
@@ -613,7 +624,7 @@ class SelfAttentionEncoder(Encoder, json_name="sa"):
 
 
 class CausalSelfAttentionEncoder(SelfAttentionEncoder, json_name="csa"):
-    __slots__ = "max_width"
+    __constants__ = ("max_width",)
     max_width: Optional[int]
 
     def __init__(
@@ -783,7 +794,7 @@ class EncoderSequence(Encoder, json_name="seq"):
 
 
 class CPCLossNetwork(torch.nn.Module, Generic[E]):
-    __slots__ = "negative_samples", "prediction_steps", "offset", "gutted_steps"
+    __constants__ = "negative_samples", "prediction_steps", "offset", "gutted_steps"
 
     negative_samples: int
     prediction_steps: int
@@ -907,7 +918,7 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
 
         lens_ = None if lens is None else lens.clamp_max(T - K)
         Az = self.prediction_encoder(context[:, : T - K], lens_)[0]  # (N, T - K, Kp* C)
-        Az = Az[:, O:].reshape(N * Tp * Kp, C, 1)
+        Az = Az[:, O:].reshape(N * Tp, Kp, C)
 
         if lens is None:
             phi_n = latent[:, O:].flatten(end_dim=1)
@@ -919,18 +930,16 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
             mask[:, :O] = False
             phi_n = latent[mask].view(-1, C)
         samps = torch.randint(phi_n.size(0), (N * Tp * M,), device=latent.device)
-        phi_n = (
-            phi_n[samps].view(N * Tp, 1, M, C).expand(N * Tp, Kp, M, C).flatten(0, 1)
-        )
-        denom = torch.bmm(phi_n, Az).squeeze(2)
-        denom = denom.logsumexp(1).view(N, Tp, Kp)
+        phi_n = phi_n[samps].view(N * Tp, M, C).transpose(1, 2)
+        denom = torch.bmm(Az, phi_n)
+        denom = denom.logsumexp(2).view(N, Tp, Kp)
         del phi_n
 
         # phi_k = self.unfold(latent[:, 1 + G + O :].unsqueeze(1))  # (N, Kp * C, Tp)
         # phi_k = phi_k.transpose(1, 2).reshape(N * Tp * Kp, 1, C)
         phi_k = latent.as_strided((N, Tp, Kp, C), (T * C, C, C, 1), C * (1 + G + O))
         phi_k = phi_k.reshape(N * Tp * Kp, 1, C)
-        num = torch.bmm(phi_k, Az).view(N, Tp, Kp)
+        num = torch.bmm(phi_k, Az.view(N * Tp * Kp, C, 1)).view(N, Tp, Kp)
         denom = num.logaddexp(denom)
         del phi_k
 
