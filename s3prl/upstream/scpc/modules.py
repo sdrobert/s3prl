@@ -28,6 +28,7 @@ from typing import (
     Literal,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Type,
     TypeVar,
@@ -43,6 +44,7 @@ __all__ = [
     "BestRqLossNetwork",
     "CausalSelfAttentionEncoder",
     "ContiguousTemporalMask",
+    "CausalConvEncoder",
     "ConvEncoder",
     "CPCLossNetwork",
     "Encoder",
@@ -133,7 +135,7 @@ class MaskingLayer(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if lens is None:
             return x, lens
-        lens = (lens + 2 * self.padding - self.window) // self.stride + 1
+        lens = (lens + self.padding - self.window) // self.stride + 1
         return (
             x.masked_fill(~get_length_mask(x, lens, self.batch_dim, self.seq_dim), 0.0),
             lens,
@@ -348,6 +350,12 @@ class IdentityEncoder(Encoder, json_name="id"):
 
 
 NonlinearityType = Literal["relu", "sigmoid", "tanh", "none"]
+NONLIN_TYPES: Final[Dict[str, Type[torch.nn.Module]]] = {
+    "relu": torch.nn.ReLU,
+    "sigmoid": torch.nn.Sigmoid,
+    "tanh": torch.nn.Tanh,
+    "none": torch.nn.Identity,
+}
 
 
 class FeedForwardEncoder(Encoder, json_name="ff"):
@@ -360,29 +368,18 @@ class FeedForwardEncoder(Encoder, json_name="ff"):
         dropout_prob: float = 0.0,
     ) -> None:
         check_positive("dropout_prob", dropout_prob, True)
-        check_in("nonlin_type", nonlin_type, {"relu", "sigmoid", "tanh", "none"})
+        check_in("nonlin_type", nonlin_type, NONLIN_TYPES)
         super().__init__(input_size, output_size)
         self.ff = torch.nn.Linear(self.input_size, self.output_size, bias)
         self.drop = torch.nn.Dropout(dropout_prob)
-        if nonlin_type == "relu":
-            self.nonlin = torch.nn.ReLU()
-        elif nonlin_type == "sigmoid":
-            self.nonlin = torch.nn.Sigmoid()
-        elif nonlin_type == "tanh":
-            self.nonlin = torch.nn.Tanh()
-        else:
-            self.nonlin = torch.nn.Identity()
+        self.nonlin = NONLIN_TYPES[nonlin_type]()
 
     @property
     def nonlin_type(self) -> NonlinearityType:
-        if isinstance(self.nonlin, torch.nn.ReLU):
-            return "relu"
-        elif isinstance(self.nonlin, torch.nn.Sigmoid):
-            return "sigmoid"
-        elif isinstance(self.nonlin, torch.nn.Tanh):
-            return "tanh"
-        else:
-            return "none"
+        for key, value in NONLIN_TYPES.items():
+            if isinstance(self.nonlin, value):
+                return key
+        raise NotImplementedError(f"Unknown nonlin_type for {self.nonlin}")
 
     @property
     def bias(self) -> bool:
@@ -410,6 +407,7 @@ class FeedForwardEncoder(Encoder, json_name="ff"):
 
 
 NormStyle = Literal["none", "batch", "instance", "channel"]
+NORM_STYLES: Final[Set[str]] = {"none", "batch", "instance", "channel"}
 
 
 class ConvEncoder(Encoder, json_name="conv"):
@@ -421,7 +419,7 @@ class ConvEncoder(Encoder, json_name="conv"):
         dropout_prob: float = 0.0,
     ) -> None:
         check_positive("dropout_prob", dropout_prob, True)
-        check_in("norm_style", norm_style, {"none", "batch", "instance", "channel"})
+        check_in("norm_style", norm_style, NORM_STYLES)
         super().__init__(input_size, output_size)
         input_size, output_size = self.input_size, self.output_size
         if norm_style == "none":
@@ -439,16 +437,18 @@ class ConvEncoder(Encoder, json_name="conv"):
 
         self.drop = torch.nn.Dropout(dropout_prob)
         self.relu = torch.nn.ReLU()
+        # XXX(sdrobert): I've removed the * 2 in the padding computations from
+        # MaskingLayer and added it here
         self.mask0 = MaskingLayer(1, 1, 0)
         self.conv1 = torch.nn.Conv1d(input_size, output_size, 10, 5, 3)
         self.norm1 = Norm()
-        self.mask1 = MaskingLayer(10, 5, 3)
+        self.mask1 = MaskingLayer(10, 5, 2 * 3)
         self.conv2 = torch.nn.Conv1d(output_size, output_size, 8, 4, 2)
         self.norm2 = Norm()
-        self.mask2 = MaskingLayer(8, 4, 2)
+        self.mask2 = MaskingLayer(8, 4, 2 * 2)
         self.conv3 = torch.nn.Conv1d(output_size, output_size, 4, 2, 1)
         self.norm3 = Norm()
-        self.mask3 = MaskingLayer(4, 2, 1)
+        self.mask3 = MaskingLayer(4, 2, 2 * 1)
         self.conv4 = torch.nn.Conv1d(output_size, output_size, 4, 2, 1)
         self.norm4 = Norm()
         self.conv5 = torch.nn.Conv1d(output_size, output_size, 4, 2, 1)
@@ -484,7 +484,7 @@ class ConvEncoder(Encoder, json_name="conv"):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = x.transpose(1, 2)  # N, C, T
         x, lens = self.mask0(x, lens)
-        x, lens = self.mask1(self.relu(self.norm1(self.conv1(self.drop(x)))), lens)
+        x, lens = self.mask1(self.relu(self.norm1(self.conv1(x))), lens)
         x, lens = self.mask2(self.relu(self.norm2(self.conv2(self.drop(x)))), lens)
         x, lens = self.mask3(self.relu(self.norm3(self.conv3(self.drop(x)))), lens)
         x, lens = self.mask3(self.relu(self.norm4(self.conv4(self.drop(x)))), lens)
@@ -499,8 +499,91 @@ class ConvEncoder(Encoder, json_name="conv"):
         return self.encode(x, lens)
 
 
+class CausalConvEncoder(Encoder, json_name="cconv"):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: Optional[int] = None,
+        kernel_size: int = 8,
+        num_layers: int = 2,
+        nonlin_type: NonlinearityType = "relu",
+        dropout_prob: float = 0.0,
+    ) -> None:
+        check_positive("num_layers", num_layers)
+        check_positive("kernel_size", kernel_size)
+        check_in("nonlin_type", nonlin_type, set(NONLIN_TYPES))
+        check_positive("dropout_prob", dropout_prob, True)
+        super().__init__(input_size, output_size)
+        # XXX(sdrobert): we accomplish causal convolutions by padding on both sides
+        # by kernel_width - 1, then lopping off all the padded coefficients on the
+        # right side after the convolutional stack
+        output_size = self.output_size
+        self.drop = torch.nn.Dropout(dropout_prob)
+        self.mask = MaskingLayer(kernel_size, 1, kernel_size - 1)
+        self.nonlin = NONLIN_TYPES[nonlin_type]()
+        p = kernel_size - 1
+        convs = [torch.nn.Conv1d(input_size, output_size, kernel_size, padding=p)]
+        convs.extend(
+            torch.nn.Conv1d(output_size, output_size, kernel_size, padding=p)
+            for _ in range(1, num_layers)
+        )
+        self.convs = torch.nn.ModuleList(convs)
+
+    @property
+    def nonlin_type(self) -> NonlinearityType:
+        for key, value in NONLIN_TYPES.items():
+            if isinstance(self.nonlin, value):
+                return key
+        raise NotImplementedError(f"Unknown nonlin_type for {self.nonlin}")
+
+    @property
+    def dropout_prob(self) -> float:
+        return self.drop.p
+
+    @property
+    def kernel_size(self) -> int:
+        conv = self.convs[0]
+        assert isinstance(conv, torch.nn.Conv1d)
+        return conv.kernel_size[0]
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.convs)
+
+    @property
+    def downsampling_factor(self) -> int:
+        return 1
+
+    def to_json(self) -> Dict[str, Any]:
+        dict_ = super().to_json()
+        assert isinstance(dict_["args"], list)
+        assert isinstance(self.convs[0], torch.nn.Conv1d)
+        dict_["args"].extend(
+            [self.kernel_size, self.num_layers, self.nonlin_type, self.dropout_prob]
+        )
+        return dict_
+
+    def encode(
+        self, x: torch.Tensor, lens: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        x = x.transpose(1, 2)  # N, C, T
+        x, lens = self.mask(x, lens)
+        for conv in self.convs:
+            x, lens = self.mask(self.nonlin(conv(x)), lens)
+            x = self.drop(x)
+        x = x[..., : x.size(2) - self.num_layers * (self.kernel_size - 1)]
+        x = x.transpose(1, 2)
+        return x, lens
+
+    def forward(
+        self, x: torch.Tensor, lens: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # already padded
+        return self.encode(x, lens)
+
+
 class SelfAttentionEncoder(Encoder, json_name="sa"):
-    __constants__ = ("pos_period",)
+    __constants__ = ("input_size", "output_size", "pos_period")
     pos_period: Optional[int]
     pos_buf: Optional[torch.Tensor]
 
@@ -602,6 +685,12 @@ class SelfAttentionEncoder(Encoder, json_name="sa"):
         valid = x.new_ones(out_shape, dtype=torch.bool)
         if lens is not None:
             valid = get_length_mask(valid, lens.repeat_interleave(self.num_heads))
+            # XXX(sdrobert): the following line is defensive. It ensures that any row
+            # past the length of the sequence (corresponding to some padded query x)
+            # attends to all values of x. Since the query is padding, the returned value
+            # should be ignored, but this line avoids a NaN being put there.
+            valid = valid | ~(valid.transpose(1, 2))
+            # assert valid[0, min(lens[0], T - 1)].all()
         return valid
 
     def get_mask(self, x: torch.Tensor, lens: Optional[torch.Tensor]) -> torch.Tensor:
@@ -869,10 +958,11 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
         negative_samples: int = 128,
         prediction_encoder: Optional[E] = None,
         num_speakers: Optional[int] = None,
-        dropout_prob: float = 0.0,
+        predictor_dropout_prob: float = 0.0,
         offset: int = 0,
         gutted_steps: int = 0,
         averaging_penalty: float = 0.0,
+        prediction_dropout_prob: float = 0.0,
     ) -> None:
         check_positive("latent_size", latent_size)
         if context_size is None:
@@ -881,7 +971,8 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
             check_positive("context_size", context_size)
         check_positive("prediction_steps", prediction_steps)
         check_positive("negative_samples", negative_samples)
-        check_positive("dropout_prob", dropout_prob, True)
+        check_positive("predictor_dropout_prob", predictor_dropout_prob, True)
+        check_positive("prediction_dropout_prob", prediction_dropout_prob, True)
         check_positive("offset", offset, True)
         if num_speakers is not None:
             check_positive("num_speakers", num_speakers)
@@ -894,7 +985,7 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
                 included_steps * latent_size,
                 "none",
                 False,
-                dropout_prob=dropout_prob,
+                dropout_prob=predictor_dropout_prob,
             )
         else:
             check_is_instance("prediction_encoder", prediction_encoder, Encoder)
@@ -924,6 +1015,7 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
             self.register_module("embed", None)
 
         self.prediction_encoder = prediction_encoder
+        self.dropout = torch.nn.Dropout(prediction_dropout_prob)
 
         # self.unfold = torch.nn.Unfold((included_steps, latent_size))
 
@@ -951,14 +1043,13 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
 
         lens_ = None if lens is None else lens.clamp_max(T - K)
         Az = self.prediction_encoder(context[:, : T - K], lens_)[0]  # (N, T - K, Kp* C)
-        Az = Az[:, O:].reshape(N * Tp, Kp, C)
+        Az = self.dropout(Az[:, O:]).reshape(N * Tp, Kp, C)
 
         if lens is None:
             phi_n = latent[:, O:].flatten(end_dim=1)
-            norm = latent.new_ones(1)
         else:
-            norm = (lens - K - O).clamp_min_(0).sum() * Kp
-            assert norm > 0, "prediction window too large"
+            norm = (lens - K - O) * Kp * N
+            assert (norm > 0).all(), "prediction window too large for sequences"
             mask = get_length_mask(latent, lens, seq_dim=1)
             mask[:, :O] = False
             phi_n = latent[mask].view(-1, C)
@@ -976,13 +1067,12 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
         del phi_k
 
         loss = denom - num  # neg num - denom
-        if lens is not None:
-            mask_ = ~get_length_mask(loss, lens - K - O, seq_dim=1)
         if lens is None:
             loss = loss.mean()
         else:
-            loss = loss.masked_fill(mask_, 0.0).sum()
-            loss = loss / norm
+            mask_ = ~get_length_mask(loss, lens - K - O, seq_dim=1)
+            loss = (loss / norm.view(N, 1, 1)).masked_fill(mask_, 0.0).sum()
+            del mask_
         if self.averaging_penalty > 0.0:
             if lens is None:
                 latent = latent[:, O:].mean(1)  # (N, C)
@@ -991,7 +1081,7 @@ class CPCLossNetwork(torch.nn.Module, Generic[E]):
                 mask /= mask.sum(2, keepdim=True).clamp_min_(1.0)
                 latent = (latent.transpose(1, 2) * mask).sum(2)
             loss = loss + latent.square().mean() * self.averaging_penalty
-        return loss  # + math.log(M + 1)
+        return loss
 
 
 class BestRqLossNetwork(torch.nn.Module, Generic[E]):
